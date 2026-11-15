@@ -1,177 +1,114 @@
 #include <algorithm>
 #include <cstdint>
+#include <format>
+#include <iostream>
 #include <list>
 #include <map>
-#include <vector>
-#include <iostream>
-#include <format>
 #include <string>
 #include <tuple>
+#include <vector>
 
+using Price   = uint32_t;
+using Qty     = uint32_t;
+using OrderId = uint32_t;
 
-// types of markest:
-// Floating
-//  - percent
+enum class Side : bool { Ask = false, Bid = true };
 
-
-enum quoteT : bool {
-  BID = true,
-  ASK = false,
+struct Order {
+  Side side;
+  Price price;
+  Qty qty;
+  OrderId id;
 };
 
-class Order {
-  public:
-  quoteT side;
-  uint32_t price;
-  uint32_t volume;
-  uint32_t id; // user id or order id
+struct Trade {
+  OrderId ask_id;
+  OrderId bid_id;
+  Qty qty;
+  Price price;
 
-  Order(quoteT _side, uint32_t _price, uint32_t _volume, uint32_t _id)
-    : side(_side), price(_price), volume(_volume), id(_id) {}
-};
-
-struct Transaction {
-  uint32_t ask_id;
-  uint32_t bid_id;
-  uint32_t volume;
-  uint32_t price;
-
-  bool operator==(const Transaction&) const = default;
+  bool operator==(const Trade&) const = default;
 
   std::string to_string() const {
-    return std::format("ask_id: {}, bid_id: {}, volume: {}, price: {}", ask_id, bid_id, volume, price);
+    return std::format("ask_id: {}, bid_id: {}, qty: {}, price: {}", ask_id, bid_id, qty, price);
   }
 };
 
-struct Level {
-  std::list<Order> orders;
+using Level = std::list<Order>;
 
-  size_t size() const { return orders.size(); }
-  bool empty() const { return orders.empty(); }
-  void push_back(Order order) { orders.push_back(order); }
-};
+class OrderBook {
+ public:
+  std::vector<Trade> match(Order incoming) {
+    std::vector<Trade> trades;
 
+    if (incoming.side == Side::Bid) fill_against(incoming, asks_, trades);
+    else                            fill_against(incoming, bids_, trades);
 
-class Orderbook {
-  std::map<uint32_t, Level, std::less<uint32_t>>  asks;
-  std::map<uint32_t, Level, std::greater<uint32_t>>  bids;
-
-  public:
-
-  std::vector<Transaction> match(Order new_order) {
-    std::vector<Transaction> transactions;
-
-    if (new_order.side == BID) {
-      while (
-          !asks.empty() &&
-          new_order.volume > 0 &&
-          new_order.price >= asks.begin()->first
-      ) {
-        auto it = asks.begin();
-        uint32_t price = it->first;
-        Level& level = it->second;
-
-        // get first order, decrement volumes, log transaction, remove element
-        while (new_order.volume > 0 && !level.empty()) {
-          Order& resting = level.orders.front();
-
-          uint32_t min_vol = std::min(resting.volume, new_order.volume);
-          new_order.volume -= min_vol;
-          resting.volume -= min_vol;
-
-          transactions.push_back({
-              .ask_id = resting.id,
-              .bid_id = new_order.id,
-              .volume = min_vol,
-              .price  = price,
-          });
-
-          if (resting.volume == 0) {
-            level.orders.pop_front();
-          }
-        }
-
-        // either level is exhausted or new_order exhausted
-        if (level.empty()) {
-          asks.erase(it);
-        }
-      }  // end iter through levels -> no ordres || new_order.vol = 0
-
-      if (new_order.volume == 0) {
-        return transactions;
-      } else {
-        bids[new_order.price].push_back(new_order);
-      }
-
-
-    } else {
-      while (
-          !bids.empty() &&
-          new_order.volume > 0 &&
-          new_order.price <= bids.begin()->first
-      ) {
-        uint32_t price = bids.begin()->first;
-        Level& level = bids.begin()->second;
-
-        // get first order, decrement volumes, log transaction, remove element
-        while (new_order.volume > 0 && !level.empty()) {
-          Order& resting = level.orders.front();
-
-          uint32_t min_vol = std::min(resting.volume, new_order.volume);
-          new_order.volume -= min_vol;
-          resting.volume -= min_vol;
-
-          transactions.push_back({
-              .ask_id = new_order.id,
-              .bid_id = resting.id,
-              .volume = min_vol,
-              .price  = price,
-          });
-
-          if (resting.volume == 0) {
-            level.orders.pop_front();
-          }
-        }
-
-        // either level is exhausted or new_order exhausted
-        if (level.empty()) {
-          bids.erase(bids.begin());
-        }
-      }  // end iter through levels -> no ordres || new_order.vol = 0
-
-      if (new_order.volume == 0) {
-        return transactions;
-      } else {
-        asks[new_order.price].push_back(new_order);
-      }
-    }
-
-
-
-      return transactions;
-    }
-
-};
-
-
-using inputT = std::vector<std::tuple<quoteT, uint32_t, uint32_t>>;
-
-std::vector<Order> parse(const inputT& input) {
-  std::vector<Order> out;
-  uint32_t next_id = 1;
-
-  for (auto [side, price, volume] : input) {
-    out.push_back(Order(side, price, volume, next_id++));
+    if (incoming.qty > 0) rest(incoming);
+    return trades;
   }
-  return out;
+
+ private:
+  template <class Book>
+  static void fill_against(Order& incoming, Book& book, std::vector<Trade>& trades) {
+    // asks use less: crosses when incoming >= resting
+    // bids use greater:crosses when incoming <= resting
+    auto crosses = [&](Price resting) { return !book.key_comp()(incoming.price, resting); };
+    bool buy = incoming.side == Side::Bid;
+
+    while (incoming.qty > 0 && !book.empty() && crosses(book.begin()->first)) {
+      auto it = book.begin();
+      auto& [price, level] = *it;
+
+      while (incoming.qty > 0 && !level.empty()) {
+        Order& resting = level.front();
+        Qty qty = std::min(incoming.qty, resting.qty);
+        incoming.qty -= qty;
+        resting.qty  -= qty;
+
+        trades.push_back({
+          .ask_id = buy ? resting.id : incoming.id,
+          .bid_id = buy ? incoming.id : resting.id,
+          .qty    = qty,
+          .price  = price,
+        });
+
+        if (resting.qty == 0) level.pop_front();
+      }
+
+      if (level.empty()) book.erase(it);
+    }
+  }
+
+  void rest(const Order& order) {
+    if (order.side == Side::Bid) bids_[order.price].push_back(order);
+    else                         asks_[order.price].push_back(order);
+  }
+
+  std::map<Price, Level, std::less<Price>>    asks_;  // best (lowest) first
+  std::map<Price, Level, std::greater<Price>> bids_;  // best (highest) first
+};
+
+
+
+using TestInput = std::vector<std::tuple<Side, Price, Qty>>;
+
+std::vector<Order> parse(const TestInput& input) {
+  std::vector<Order> orders;
+  OrderId next_id = 1;
+
+  for (auto [side, price, qty] : input) {
+    orders.push_back({.side = side, .price = price, .qty = qty, .id = next_id++});
+  }
+  return orders;
 }
 
-bool run_test(const std::string& name, const inputT& input, const std::vector<Transaction>& expected) {
-  Orderbook ob;
-  std::vector<Transaction> got;
+bool run_test(const std::string& name, const TestInput& input, const std::vector<Trade>& expected) {
+  OrderBook book;
+  std::vector<Trade> got;
 
   for (const Order& order : parse(input)) {
-    auto trades = ob.match(order);
+    auto trades = book.match(order);
     got.insert(got.end(), trades.begin(), trades.end());
   }
 
@@ -188,71 +125,71 @@ bool run_test(const std::string& name, const inputT& input, const std::vector<Tr
 }
 
 int main() {
+  using enum Side;  // lets tests write Bid / Ask
+
   int failed = 0;
-  auto check = [&](const std::string& name, const inputT& input, const std::vector<Transaction>& expected) {
+  auto check = [&](const std::string& name, const TestInput& input, const std::vector<Trade>& expected) {
     if (!run_test(name, input, expected)) ++failed;
   };
 
-  // Transaction fields: {ask_id, bid_id, volume, price}
-
   check("no cross: bid below ask", {
-    {BID, 5, 1},
-    {ASK, 6, 1},
+    {Bid, 5, 1},
+    {Ask, 6, 1},
   }, {});
 
   check("exact cross", {
-    {ASK, 5, 1},
-    {BID, 5, 1},
+    {Ask, 5, 1},
+    {Bid, 5, 1},
   }, {{1, 2, 1, 5}});
 
   check("trade at resting price, bid aggressive", {
-    {ASK, 5, 1},
-    {BID, 7, 1},
+    {Ask, 5, 1},
+    {Bid, 7, 1},
   }, {{1, 2, 1, 5}});
 
   check("trade at resting price, ask aggressive", {
-    {BID, 7, 1},
-    {ASK, 5, 1},
+    {Bid, 7, 1},
+    {Ask, 5, 1},
   }, {{2, 1, 1, 7}});
 
   check("unfilled asks rest on ask side", {
-    {ASK, 10, 1},
-    {ASK, 3, 1},     // must not trade with the ask above
-    {BID, 10, 2},    // takes cheapest first
+    {Ask, 10, 1},
+    {Ask, 3, 1},     // must not trade with the ask above
+    {Bid, 10, 2},    // takes cheapest first
   }, {{2, 3, 1, 3}, {1, 3, 1, 10}});
 
   check("best bid hit first", {
-    {BID, 5, 1},
-    {BID, 6, 1},
-    {ASK, 4, 2},
+    {Bid, 5, 1},
+    {Bid, 6, 1},
+    {Ask, 4, 2},
   }, {{3, 2, 1, 6}, {3, 1, 1, 5}});
 
   check("time priority within a level", {
-    {ASK, 5, 1},
-    {ASK, 5, 1},
-    {BID, 5, 1},
-    {BID, 5, 1},
+    {Ask, 5, 1},
+    {Ask, 5, 1},
+    {Bid, 5, 1},
+    {Bid, 5, 1},
   }, {{1, 3, 1, 5}, {2, 4, 1, 5}});
 
   check("partial fill of resting order", {
-    {ASK, 5, 10},
-    {BID, 5, 4},
-    {BID, 5, 6},
-    {BID, 5, 1},     // ask is used up, this one rests
+    {Ask, 5, 10},
+    {Bid, 5, 4},
+    {Bid, 5, 6},
+    {Bid, 5, 1},     // ask is used up, this one rests
   }, {{1, 2, 4, 5}, {1, 3, 6, 5}});
 
   check("sweep levels, stop at limit, remainder rests", {
-    {ASK, 5, 1},
-    {ASK, 6, 1},
-    {ASK, 7, 1},
-    {BID, 6, 3},     // fills 5 and 6, 1 left rests at 6
-    {ASK, 6, 1},     // hits the rested bid
+    {Ask, 5, 1},
+    {Ask, 6, 1},
+    {Ask, 7, 1},
+    {Bid, 6, 3},     // fills 5 and 6, 1 left rests at 6
+    {Ask, 6, 1},     // hits the rested bid
   }, {{1, 4, 1, 5}, {2, 4, 1, 6}, {5, 4, 1, 6}});
 
   check("aggressive ask larger than book rests", {
-    {BID, 5, 2},
-    {ASK, 5, 5},     // fills 2, rests 3 at 5
-    {BID, 6, 3},
+    {Bid, 5, 2},
+    {Ask, 5, 5},     // fills 2, rests 3 at 5
+    {Bid, 6, 3},
   }, {{2, 1, 2, 5}, {2, 3, 3, 5}});
 
   if (failed) std::cout << failed << " test(s) failed\n";
